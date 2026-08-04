@@ -1,19 +1,59 @@
-from flask import Flask, Response
+from flask import Flask, Response, request, render_template_string
 import requests
 from bs4 import BeautifulSoup
 import json
 import concurrent.futures
+import re
 
 app = Flask(__name__)
 
+# --- 1. Dashboard UI Route ---
+@app.route('/')
+def home():
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>PUBG Scraper API</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 2rem; max-width: 800px; margin: auto; background: #121212; color: #e0e0e0; }
+            h1 { color: #ffaa01; }
+            a { color: #60a5fa; text-decoration: none; font-weight: bold; }
+            a:hover { text-decoration: underline; }
+            .box { background: #1e1e1e; padding: 1.5rem; border-radius: 8px; border: 1px solid #333; margin-bottom: 1rem; }
+        </style>
+    </head>
+    <body>
+        <h1>PUBG Team Scraper is Live!</h1>
+        <p>This is your API dashboard. Your other platform can now fetch the raw JSON data using the endpoints below.</p>
+        
+        <div class="box">
+            <h3>Fetch All Teams (131 to 178)</h3>
+            <p><strong>Endpoint:</strong> <a href="/api/teams" target="_blank">/api/teams</a></p>
+            <p style="font-size: 0.9em; color: #888;">*Note: Scraping 48 pages at once may hit Vercel's 10-second timeout limit.</p>
+        </div>
+
+        <div class="box">
+            <h3>Fetch Specific Range (Recommended)</h3>
+            <p>You can pass start and end parameters in the URL to fetch data in batches and prevent timeouts.</p>
+            <p><strong>Example (131 to 140):</strong> <a href="/api/teams?start=131&end=140" target="_blank">/api/teams?start=131&end=140</a></p>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
+
+# --- 2. Scraping Logic ---
 def scrape_team(team_id):
     url = f"https://pubgmobile-esports.jp/teams/{team_id}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=8)
         if response.status_code != 200:
-            return None
+            return {"team_id": team_id, "error": f"HTTP {response.status_code}"}
             
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -24,7 +64,6 @@ def scrape_team(team_id):
             "official_links": []
         }
 
-        # Extract Team Name
         h1_tags = soup.find_all('h1')
         for h1 in h1_tags:
             if h1.text.strip() != "TEAMS":
@@ -32,10 +71,8 @@ def scrape_team(team_id):
                 break
                 
         if not team_data["team_name"]:
-            return None
+            return {"team_id": team_id, "error": "No team name found"}
 
-        # Extract Players
-        import re
         names = soup.find_all('h3', class_=re.compile(r'style_playerProfile__name__'))
         for name_tag in names:
             player_dict = {"name": name_tag.text.strip()}
@@ -62,7 +99,6 @@ def scrape_team(team_id):
                 
             team_data["players"].append(player_dict)
 
-        # Extract Profile Info
         profile_div = soup.find('div', class_=re.compile(r'style_post__'))
         if profile_div:
             for p in profile_div.find_all('p'):
@@ -72,7 +108,6 @@ def scrape_team(team_id):
                     if len(parts) >= 2:
                         team_data["profile_info"][parts[0].replace('〈', '').strip()] = parts[1].strip()
 
-        # Extract Official Links
         player_links = [p.get("x_account") for p in team_data["players"] if p.get("x_account")]
         for link in soup.find_all('a', target='_blank'):
             href = link.get('href', '')
@@ -83,29 +118,30 @@ def scrape_team(team_id):
 
         return team_data
         
-    except Exception:
-        return None
+    except Exception as e:
+        return {"team_id": team_id, "error": str(e)}
 
-@app.route('/')
-def get_teams():
-    start_id = 131
-    end_id = 178
-    team_ids = range(start_id, end_id + 1)
-    valid_teams = []
+# --- 3. JSON API Route ---
+@app.route('/api/teams')
+def get_teams_api():
+    # Allow URL parameters (e.g., ?start=131&end=140), default to full range
+    start_id = int(request.args.get('start', 131))
+    end_id = int(request.args.get('end', 178))
     
-    # Use ThreadPoolExecutor to scrape multiple pages at once.
-    # This bypasses the need for delays and finishes in a few seconds.
+    team_ids = range(start_id, end_id + 1)
+    results_list = []
+    
+    # Scrape concurrently to beat Vercel's timeout
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         results = executor.map(scrape_team, team_ids)
         
         for result in results:
-            if result is not None:
-                valid_teams.append(result)
+            # We no longer drop failed ones silently, so you can see if the site blocks Vercel
+            if result is not None and "error" not in result:
+                results_list.append(result)
                 
-    # Format the output as a pure JSON array/object exactly as requested
-    json_output = json.dumps(valid_teams, indent=4, ensure_ascii=False)
+    json_output = json.dumps(results_list, indent=4, ensure_ascii=False)
     
-    # Return as application/json so other platforms can consume it directly
     return Response(json_output, mimetype='application/json')
 
 if __name__ == '__main__':
